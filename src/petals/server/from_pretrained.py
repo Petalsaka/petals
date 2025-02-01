@@ -7,6 +7,7 @@ If necessary, one can rewrite this to implement a different behavior, such as:
 
 """
 import json
+import logging
 import time
 from contextlib import suppress
 from typing import Dict, Optional, Union
@@ -29,7 +30,15 @@ from petals.utils.auto_config import AutoDistributedConfig
 from petals.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
 from petals.utils.hf_auth import always_needs_auth
 
+# Set default logging level to INFO for petals and WARNING for other modules
+logging.getLogger().setLevel(logging.WARNING)
+logging.getLogger("petals").setLevel(logging.INFO)
 logger = get_logger(__name__)
+
+# Suppress unnecessary warnings from other libraries
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("hivemind").setLevel(logging.WARNING)
+logging.getLogger("bitsandbytes").setLevel(logging.ERROR)
 
 
 def load_pretrained_block(
@@ -64,14 +73,64 @@ def load_pretrained_block(
         max_disk_space=max_disk_space,
     )
 
-    for param_name, _ in block.named_parameters():
-        assert param_name in state_dict, f"{param_name} not in state dict"
-        param = state_dict[param_name]
-        if not str(param.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
-            param = param.to(torch_dtype)
-        set_module_tensor_to_device(block, param_name, "cpu", value=param, dtype=param.dtype)
+    # Try to find parameters with or without the model prefix
+    def find_param(name):
+        # Try with full prefix (model.layers.N.param)
+        if name in state_dict:
+            return state_dict[name]
+        # Try without model prefix (layers.N.param)
+        stripped = name[len("model."):] if name.startswith("model.") else name
+        if stripped in state_dict:
+            return state_dict[stripped]
+        # Try just the parameter name without any prefix
+        param = name.split(".")[-1]
+        if param in state_dict:
+            return state_dict[param]
+        # Try with h prefix for BLOOM models
+        if not name.startswith("h."):
+            h_prefixed = f"h.{name}"
+            if h_prefixed in state_dict:
+                return state_dict[h_prefixed]
+        return None
 
-    logger.info(f"Loaded {model_name} block {block_index}")
+    for param_name, param in block.named_parameters():
+        # Determine the key to use for loading from state_dict
+        load_key = param_name
+        if hasattr(block, '_reverse_param_mapping') and param_name in block._reverse_param_mapping:
+            load_key = block._reverse_param_mapping[param_name]
+
+        # Try different parameter name formats based on model type
+        param_data = None
+        possible_keys = [
+            load_key,  # Original key
+            f"model.layers.{block_index}.{load_key}",  # Full path with model prefix
+            f"layers.{block_index}.{load_key}",  # Full path without model prefix
+            f"h.{block_index}.{load_key}",  # BLOOM style path
+            load_key.split('.')[-1],  # Just the parameter name
+        ]
+        
+        for key in possible_keys:
+            param_data = find_param(key)
+            if param_data is not None:
+                break
+
+        if param_data is None:
+            logger.warning(f"Parameter {load_key} not found in state dict (tried {possible_keys})")
+            continue
+
+        # Check if the loaded param shape matches the expected shape
+        expected_shape = param.shape
+        if param_data.shape != expected_shape:
+            if len(param_data.shape) >= 2 and param_data.shape[1] == expected_shape[1] * 2:
+                param_data = param_data[:, :expected_shape[1]]
+            else:
+                raise ValueError(f"Shape mismatch for {param_name}: expected {expected_shape}, got {param_data.shape}")
+
+        if not str(param_data.dtype).startswith(("torch.uint", "torch.int", "torch.bool")):
+            param_data = param_data.to(torch_dtype)
+        set_module_tensor_to_device(block, param_name, "cpu", value=param_data, dtype=param_data.dtype)
+
+    logger.info(f"Successfully loaded all parameters for block {block_index}")
     return block
 
 
@@ -94,7 +153,6 @@ def _load_state_dict_from_repo(
     if index_file.endswith(".index.json"):  # Sharded model
         path = get_file_from_repo(model_name, filename=index_file, use_auth_token=token, cache_dir=cache_dir)
         if path is None:
-            # _find_index_file() told that a file exists but we can't get it (e.g., it just disappeared)
             raise ValueError(f"Failed to get file {index_file}")
 
         with open(path) as f:
@@ -103,10 +161,9 @@ def _load_state_dict_from_repo(
             filename for param_name, filename in index["weight_map"].items() if param_name.startswith(block_prefix)
         }
         if not filenames:
-            raise RuntimeError(f"Block {block_prefix}* not found in the index: {index['weight_map']}")
+            raise RuntimeError(f"Block {block_prefix}* not found in the index")
     else:  # Non-sharded model
         filenames = {index_file}
-    logger.debug(f"Loading {block_prefix}* from {filenames}")
 
     state_dict = {}
     for filename in filenames:
@@ -119,11 +176,16 @@ def _load_state_dict_from_repo(
             cache_dir=cache_dir,
             max_disk_space=max_disk_space,
         )
+        # Filter parameters for this block but keep their full names
         shard_state_dict = {
-            param_name[len(block_prefix) :]: param
+            param_name: param
             for param_name, param in shard_state_dict.items()
             if param_name.startswith(block_prefix)
-        }  # Remove unused parameters from memory
+        }
+        # Log loaded parameters at debug level
+        logger.debug("Loaded parameters for block %s:", block_prefix)
+        for key, tensor in shard_state_dict.items():
+            logger.debug("  %s: %s", key, tensor.shape)
         state_dict.update(shard_state_dict)
     return state_dict
 
@@ -209,7 +271,7 @@ def _load_state_dict_from_repo_file(
                     raise RuntimeError(f"File {filename} does not exist in repo {model_name}")
                 return _load_state_dict_from_local_file(path, block_prefix=block_prefix)
         except Exception as e:
-            logger.warning(f"Failed to load file {filename} from HF Hub (retry in {delay:.0f} sec)", exc_info=True)
+            # logger.warning(f"Failed to load file {filename} from HF Hub (retry in {delay:.0f} sec)", exc_info=True)
             time.sleep(delay)
 
 

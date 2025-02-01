@@ -2,7 +2,8 @@ import dataclasses
 from enum import Enum
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-import pydantic.v1 as pydantic
+from pydantic import Field, conint, confloat
+from pydantic.dataclasses import dataclass
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
 
@@ -17,9 +18,9 @@ def parse_uid(uid: ModuleUID) -> Tuple[str, int]:
     return dht_prefix, int(index)
 
 
-@pydantic.dataclasses.dataclass
+@dataclass
 class ModelInfo:
-    num_blocks: pydantic.conint(ge=1, strict=True)
+    num_blocks: int = Field(ge=1)
     repository: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -36,30 +37,30 @@ class ServerState(Enum):
     ONLINE = 2
 
 
-RPS = pydantic.confloat(ge=0, allow_inf_nan=False, strict=True)
+RPS = float
 
 
-@pydantic.dataclasses.dataclass
+@dataclass
 class ServerInfo:
     state: ServerState
-    throughput: RPS
+    throughput: float = Field(ge=0)
 
-    start_block: Optional[pydantic.conint(ge=0, strict=True)] = None
-    end_block: Optional[pydantic.conint(ge=0, strict=True)] = None
+    start_block: Optional[int] = Field(None, ge=0)
+    end_block: Optional[int] = Field(None, ge=0)
 
     public_name: Optional[str] = None
     version: Optional[str] = None
 
-    network_rps: Optional[RPS] = None
-    forward_rps: Optional[RPS] = None
-    inference_rps: Optional[RPS] = None
+    network_rps: Optional[float] = Field(None, ge=0)
+    forward_rps: Optional[float] = Field(None, ge=0)
+    inference_rps: Optional[float] = Field(None, ge=0)
 
     adapters: Sequence[str] = ()
     torch_dtype: Optional[str] = None
     quant_type: Optional[str] = None
     using_relay: Optional[bool] = None
-    cache_tokens_left: Optional[pydantic.conint(ge=0, strict=True)] = None
-    next_pings: Optional[Dict[str, pydantic.confloat(ge=0, strict=True)]] = None
+    cache_tokens_left: Optional[int] = Field(None, ge=0)
+    next_pings: Optional[Dict[str, float]] = None
 
     def to_tuple(self) -> Tuple[int, float, dict]:
         extra_info = dataclasses.asdict(self)

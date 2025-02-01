@@ -612,6 +612,10 @@ class ModuleContainer(threading.Thread):
         for handler in self.conn_handlers:
             handler.run_in_background()
 
+        # Set the ready flag and log the Started message
+        self.runtime.ready.set()
+        logger.info("Started")
+
         self.runtime.run()
 
     def run_in_background(self, await_ready=True, timeout=None):
