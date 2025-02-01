@@ -42,6 +42,7 @@ async def sequential_forward(
     inputs_dtype = inputs.dtype
     inputs = inputs.cpu()
     prompts = prompts.cpu()
+    hypo_ids = torch.arange(inputs.shape[0], dtype=torch.int64, device='cpu')
 
     end_index = end_index if end_index is not None else len(sequence_manager.block_uids)
     assert start_index >= 0 and end_index <= len(sequence_manager.block_uids)
@@ -68,7 +69,7 @@ async def sequential_forward(
                 span = sequences.popleft()
 
                 stub = TransformerConnectionHandler.get_stub(sequence_manager.state.p2p, span.peer_id)
-                flat_tensors, args_structure = pack_args_kwargs(inputs, prompts[span.start : span.end])
+                flat_tensors, args_structure = pack_args_kwargs(inputs, prompts[span.start : span.end], hypo_ids)
 
                 span_uids = CHAIN_DELIMITER.join(sequence_manager.block_uids[span.start : span.end])
                 metadata = sequence_manager.get_request_metadata(

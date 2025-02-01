@@ -13,6 +13,7 @@ from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
 class WrappedMixtralBlock(MixtralDecoderLayer):
     def __init__(self, config: MixtralConfig, layer_idx: int):
         super().__init__(config, layer_idx)
+        print(f"Initializing Mixtral block with head_dim={self.self_attn.head_dim}, num_heads={self.self_attn.num_key_value_heads}")
 
         self._attn_implementation = config._attn_implementation
         self.sliding_window = config.sliding_window
@@ -84,7 +85,7 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
             present_key_value = outputs[-1]
             present_key_value = present_key_value[self.layer_idx]
             present_key_value = self._reorder_cache_to_bloom(present_key_value, batch_size, seq_length_with_past)
-            outputs = outputs[:-1] + (present_key_value,)
+            outputs = outputs[:-1] + present_key_value
 
         return outputs
 
@@ -103,11 +104,13 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
     def _reorder_cache_to_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
-        # TODO: Move to mixin
         key_states, value_states = key_value
         value_states = value_states.view(
             batch_size * self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
         )
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
-        return (key_states, value_states)
+        combined = torch.cat([key_states, value_states], dim=-1)
+        print(f"Mixtral->Bloom cache type: {type(combined)}, shape: {combined.shape}")
+        assert isinstance(combined, torch.Tensor), "Mixtral must return single tensor"
+        return (combined,)

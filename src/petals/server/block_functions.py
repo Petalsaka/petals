@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
-from hivemind.moe.expert_uid import ExpertUID
+from hivemind.moe.expert_uid import ExpertUID as ExpertUIDType
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 from hivemind.utils.nested import nested_flatten
@@ -18,7 +18,7 @@ from petals.server.task_pool import PrioritizedTaskPool
 from petals.server.task_prioritizer import TaskPrioritizerBase
 from petals.utils.convert_block import QuantType
 from petals.utils.misc import DUMMY, is_dummy
-from petals.utils.packaging import unpack_args_kwargs
+from petals.utils.packaging import pack_args_kwargs, unpack_args_kwargs
 
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
@@ -142,9 +142,9 @@ async def run_rpc_backward(
 
 
 async def iterate_rpc_inference(
-    requested_uids: Sequence[ExpertUID],
+    requested_uids: Sequence[str],
     requested_backends: Sequence[TransformerBackend],
-    active_adapter: Optional[str],
+    active_adapter: str | None,
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
     *,
@@ -154,30 +154,43 @@ async def iterate_rpc_inference(
     quant_type: QuantType,
     args_structure: Any = None,
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
-    assert len(cache_handles) == len(requested_backends)
-
+    """
+    Process a sequence of inference requests from a client.
+    :param requested_uids: a list of block uids that will process the request
+    :param requested_backends: a list of TransformerBackend instances corresponding to requested_uids
+    :param active_adapter: name of the active LoRA adapter or None
+    :param input_iterator: an iterator over (request, metadata) pairs
+    :param cache_handles: a list of cache handles for each backend
+    :param max_length: maximum sequence length for this session
+    :param prioritizer: a task prioritizer instance
+    :param points: number of points to spend on this request
+    :param quant_type: quantization type used by the server
+    :param args_structure: structure of the input arguments (optional)
+    :returns: yields tuples of (output_tensors, can_push, step_metadata)
+    """
     prefix_length = 0
-    point_per_piece = points / max_length if max_length > 0 else 0.0
+    point_per_piece = points / len(requested_backends)
 
-    async for request, step_metadata in input_iterator:
-        if "start_from_position" in step_metadata:
-            start_from_position = step_metadata["start_from_position"]
-            assert (
-                prefix_length >= start_from_position,
-            ), f"prefix_length={prefix_length}, start_from_position={start_from_position}"
-            prefix_length = start_from_position
-
-        flat_tensors = tuple(deserialize_torch_tensor(tensor) for tensor in request.tensors)
+    async for request, metadata in input_iterator:
+        # First deserialize all tensors
+        flat_tensors = [deserialize_torch_tensor(tensor) for tensor in request.tensors]
+        
+        # If we have args_structure, unpack the tensors according to it
         if args_structure is not None:
-            # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
-            flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
+            flat_tensors, _ = unpack_args_kwargs(flat_tensors, args_structure)
+            inputs, prompts, hypo_ids = flat_tensors
+        else:
+            # If no args_structure, assume default order
+            inputs, prompts, hypo_ids = flat_tensors[0], flat_tensors[1], flat_tensors[2] if len(flat_tensors) > 2 else None
 
-        hidden_states, prompts, hypo_ids, *_ = flat_tensors
-        batch_size, length_increment, _ = hidden_states.shape
+        batch_size, length_increment, _ = inputs.shape
 
         # Cast inputs to backend dtype
-        hidden_states = hidden_states.to(requested_backends[0].dtype)
-        assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
+        inputs = inputs.to(requested_backends[0].dtype)
+        if hypo_ids is not None and not is_dummy(hypo_ids):
+            assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
+        else:
+            hypo_ids = torch.arange(batch_size, dtype=torch.int64, device=inputs.device)
 
         # parse deep prompts (optional argument)
         has_prompts = prompts is not None and not is_dummy(prompts)
@@ -199,7 +212,7 @@ async def iterate_rpc_inference(
         merge_max_tokens = MAX_NF4_SHORT_INFERENCE_TOKENS if quant_type == QuantType.NF4 else MAX_SHORT_INFERENCE_TOKENS
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
         priority = prioritizer.prioritize(
-            hidden_states,
+            inputs,
             hypo_ids,
             points=point_per_piece,
             requested_uids=requested_uids,
@@ -208,30 +221,32 @@ async def iterate_rpc_inference(
 
         # A client may pass a tensor with 0 tokens. This is a special case that occurs, e.g.
         # when user wants to pre-allocate cache or check that server *can* allocate that cache.
-        if hidden_states.numel() > 0:
-            assert hidden_states.ndim == 3, f"hidden states must be a single 3d tensor"
+        if inputs.numel() > 0:
+            assert inputs.ndim == 3, f"hidden states must be a single 3d tensor"
             if can_merge_pools:
                 inference_infos = tuple(
                     InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
-                (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
-                    hidden_states, hypo_ids, inference_infos, *prompts, priority=priority
+                # Pass all prompts, even None ones, as the MergedInferenceStep will handle them
+                (inputs,) = await requested_backends[0].inference_pool.submit_task(
+                    inputs, hypo_ids, inference_infos, *prompts, priority=priority
                 )
             else:
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
                     inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
-                    (hidden_states,) = await backend.inference_pool.submit_task(
-                        hidden_states, hypo_ids, inference_infos, prompt, priority=priority
+                    # Pass the prompt as is, the inference_step will handle None/dummy values
+                    (inputs,) = await backend.inference_pool.submit_task(
+                        inputs, hypo_ids, inference_infos, prompt, priority=priority
                     )
 
         # serialize and send last layer outputs
         output_tensors = [
             serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
-            for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
+            for result, proto in zip((inputs,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
         can_push = not has_prompts
-        yield output_tensors, can_push, step_metadata
+        yield output_tensors, can_push, metadata
 
         # prepare for next step
         prefix_length += length_increment

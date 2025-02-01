@@ -169,6 +169,27 @@ class _ServerInferenceSession:
 
         self._position += n_input_tokens
 
+        try:
+            # Before processing
+            if self._position is not None:
+                request_metadata["start_from_position"] = self._position
+                # Verify server session position matches client
+                if self.position != self._position:
+                    self.position = self._position  # Force reset server position
+                
+        except Exception as e:
+            # Improved error handling
+            logger.warning(f"Position mismatch detected: {e}")
+            self._sequence_manager.on_request_failure(self.span.peer_id)
+            if attempt_no + 1 == self._sequence_manager.config.max_retries:
+                raise RuntimeError(f"Persistent position mismatch after {attempt_no+1} attempts") from e
+            
+            # Reset position and retry
+            self.position = max(0, self._position - n_input_tokens)
+            delay = self._sequence_manager.get_retry_delay(attempt_no)
+            logger.info(f"Retrying from position {self.position} in {delay:.1f}s")
+            time.sleep(delay)
+
         return outputs[0]
 
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:

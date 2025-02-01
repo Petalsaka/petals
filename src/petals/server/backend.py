@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Type, Union, cast, TypeVar
 
 import torch
 from hivemind import BatchTensorDescriptor, TensorDescriptor
@@ -10,13 +10,17 @@ from hivemind.moe.expert_uid import ExpertUID
 from hivemind.moe.server.module_backend import ModuleBackend
 from hivemind.utils import get_logger
 from tensor_parallel import TensorParallel
-from tensor_parallel.tensor_parallel import PerDeviceTensors
+from torch import nn
 from transformers import PretrainedConfig
+from transformers.models.bloom.modeling_bloom import BloomAttention
 
 from petals.data_structures import InferenceMetadata
 from petals.server.memory_cache import MemoryCache
 from petals.server.task_pool import PrioritizedTaskPool
 from petals.utils.misc import get_size_in_bytes, is_dummy
+
+# Type definitions
+BackendType = TypeVar('BackendType', bound='TransformerBackend')
 
 logger = get_logger(__name__)
 
@@ -65,10 +69,14 @@ class TransformerBackend(ModuleBackend):
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
         self.shard_num_heads = []
+        
+        # Find attention modules and collect their head counts
         for shard in self.module.module_shards:
             for submodule in shard.modules():
-                if isinstance(submodule, config.attn_class):
+                if hasattr(submodule, "num_heads") and isinstance(submodule, nn.Module):
                     self.shard_num_heads.append(submodule.num_heads)
+                    break  # Found the attention module in this shard
+                    
         assert len(self.shard_num_heads) == len(self.module.devices)
         assert sum(self.shard_num_heads) == config.num_attention_heads
 
@@ -93,6 +101,7 @@ class TransformerBackend(ModuleBackend):
             num_heads //= self.config.num_key_value_groups
             if hasattr(self.config, "num_key_value_heads"):
                 num_heads = self.config.num_key_value_heads
+            # Create separate key and value tensors
             keys = TensorDescriptor((batch_size, num_heads, head_dim, max_length), dtype=self.dtype, device=device)
             values = TensorDescriptor((batch_size, num_heads, max_length, head_dim), dtype=self.dtype, device=device)
             cache_tensors.extend((keys, values))
@@ -112,35 +121,83 @@ class TransformerBackend(ModuleBackend):
     def inference_step(
         self,
         hidden_states: torch.Tensor,
-        hypo_ids: torch.LongTensor,
+        hypo_ids: Optional[torch.LongTensor],
         inference_info: InferenceMetadata,
     ) -> Tuple[torch.Tensor, ...]:
+        """Compute next transformer layer(s) using this server's part of the model"""
         assert hidden_states.ndim == 3, "expected hidden states to be 3-dimensional: [batch_size, seq_len, hid_size]"
         seq_len = hidden_states.shape[1]
-
-        with self.memory_cache.use_cache(
-            *inference_info.cache_handles
-        ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter):
+        
+        logger.debug(f"Starting inference step with hidden_states shape: {hidden_states.shape}")
+        logger.debug(f"Inference info: prefix_length={inference_info.prefix_length}")
+        
+        if hypo_ids is None:
+            logger.debug("No hypo_ids provided, creating default range")
+            hypo_ids = torch.arange(hidden_states.shape[0], dtype=torch.int64, device=hidden_states.device)
+        else:
+            logger.debug(f"Using provided hypo_ids: {hypo_ids}")
+            
+        with self.memory_cache.use_cache(*inference_info.cache_handles) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter):
+            logger.debug(f"Retrieved {len(cache_tensors)} cache tensors")
+            for i, tensor in enumerate(cache_tensors):
+                logger.debug(f"  Cache tensor {i}: shape={tensor.shape}, dtype={tensor.dtype}, device={tensor.device}")
+            
             self._reorder_cache_inplace(cache_tensors, hypo_ids)
-
+            
             # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
             # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
             # is at least 4-6x less than `autograd_memory`.
             max_chunk_length = self._estimate_max_chunk_length(hidden_states, inference_info)
+            logger.debug(f"Estimated max chunk length: {max_chunk_length}")
+            
             output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None
             layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length)
+            
+            logger.debug(f"Created layer_past: type={type(layer_past)}")
+            if layer_past is not None:
+                # Get key and value states for logging
+                key_states = layer_past[0]  # Use __getitem__ to get key states
+                value_states = layer_past[1]  # Use __getitem__ to get value states
+                logger.debug(f"Layer past key shape: {key_states.shape}")
+                logger.debug(f"Layer past value shape: {value_states.shape}")
+            
             for offset in range(0, seq_len, max_chunk_length):
-                hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :]
-                output_hidden_states_chunk, new_kvs = self.module.forward(
-                    hidden_states_chunk, layer_past=layer_past, use_cache=True
-                )
-                if seq_len > max_chunk_length:
-                    output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk
+                chunk_length = min(max_chunk_length, seq_len - offset)
+                hidden_states_chunk = hidden_states[:, offset:offset + chunk_length]
+                logger.debug(f"Processing chunk at offset {offset} with length {chunk_length}")
+                
+                try:
+                    outputs = self.module(
+                        hidden_states_chunk,
+                        layer_past=layer_past,
+                        use_cache=True
+                    )
+                    logger.debug(f"Module output type: {type(outputs)}")
+                    if isinstance(outputs, tuple):
+                        logger.debug(f"Output tuple length: {len(outputs)}")
+                        for i, out in enumerate(outputs):
+                            logger.debug(f"  Output {i}: type={type(out)}, shape={getattr(out, 'shape', 'N/A')}")
+                except Exception as e:
+                    logger.error(f"Error in module forward pass: {str(e)}")
+                    raise
+                
+                if isinstance(outputs, tuple):
+                    output_hidden_states_chunk = outputs[0]
+                    new_kvs = outputs[-1] if len(outputs) > 2 else None
                 else:
-                    output_hidden_states = output_hidden_states_chunk  # saves one memcopy
-                layer_past = new_kvs
-
-            self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length)
+                    output_hidden_states_chunk = outputs
+                    new_kvs = None
+                
+                if seq_len > max_chunk_length:
+                    output_hidden_states[:, offset:offset + chunk_length] = output_hidden_states_chunk
+                else:
+                    output_hidden_states = output_hidden_states_chunk
+                    
+                if new_kvs is not None and layer_past is not None:
+                    logger.debug("Updating layer_past with new KV cache")
+                    layer_past.update(*new_kvs, layer_idx=0)
+            
+            logger.debug(f"Completed inference step, output shape: {output_hidden_states.shape}")
             return (output_hidden_states,)
 
     def _estimate_max_chunk_length(self, hidden_states: torch.Tensor, inference_info: InferenceMetadata) -> int:
@@ -151,33 +208,107 @@ class TransformerBackend(ModuleBackend):
         attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
         return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
 
-    def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
+    def _reorder_cache_inplace(self, cache_tensors: Sequence[torch.Tensor], hypo_ids: torch.Tensor):
         """If hypo_ids is specified, reorder elements of each cache tensor in-place by taking indices from hypo_ids"""
         if not is_dummy(hypo_ids):
-            for cache_tensor in cache_tensors:
-                cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
+            logger.debug(f"Reordering cache tensors with hypo_ids: {hypo_ids}")
+            for i, cache_tensor in enumerate(cache_tensors):
+                logger.debug(f"  Before reorder - Cache tensor {i}: shape={cache_tensor.shape}, dtype={cache_tensor.dtype}")
+                try:
+                    cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
+                    logger.debug(f"  After reorder - Cache tensor {i}: shape={cache_tensor.shape}, dtype={cache_tensor.dtype}")
+                except Exception as e:
+                    logger.error(f"Error reordering cache tensor {i}: {str(e)}")
+                    logger.error(f"  Tensor shape: {cache_tensor.shape}")
+                    logger.error(f"  Hypo_ids shape: {hypo_ids.shape}")
+                    logger.error(f"  Hypo_ids device: {hypo_ids.device}")
+                    logger.error(f"  Tensor device: {cache_tensor.device}")
+                    raise
 
-    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Sequence[torch.Tensor]:
-        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
-        key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
-        for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i].flatten(0, 1)[:, :, :prefix_length]
-            # shape: [batch * num_kv_heads, head_dim, kv_length]
-            value_cache[i] = value_cache[i].flatten(0, 1)[:, :prefix_length]
-            # shape: [batch * num_kv_heads, kv_length, head_dim]
-        layer_past = tuple(chain(*zip(key_cache, value_cache)))
-        return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
+    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Optional[_BloomCacheWrapper]:
+        if not cache_tensors:
+            return None
+
+        if len(cache_tensors) % 2 != 0:
+            raise ValueError(f"Expected even number of cache tensors (key-value pairs), got {len(cache_tensors)}")
+            
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        
+        # Process key and value tensors separately
+        key_tensors = []
+        value_tensors = []
+        
+        for i in range(0, len(cache_tensors), 2):
+            key = cache_tensors[i]
+            value = cache_tensors[i + 1]
+            
+            batch_size, num_heads = key.shape[:2]
+            
+            # Process key: [batch, heads, head_dim, seq_len] -> [batch*heads, seq_len, head_dim]
+            key = key.view(batch_size, num_heads, head_dim, -1)
+            key = key.permute(0, 1, 3, 2)  # [batch, heads, seq_len, head_dim]
+            key = key.reshape(batch_size * num_heads, -1, head_dim)
+            
+            # Process value: [batch, heads, seq_len, head_dim] -> [batch*heads, seq_len, head_dim]
+            value = value.view(batch_size, num_heads, -1, head_dim)
+            value = value.reshape(batch_size * num_heads, -1, head_dim)
+            
+            key_tensors.append(key)
+            value_tensors.append(value)
+        
+        # Concatenate along the batch*heads dimension
+        combined_key = torch.cat(key_tensors, dim=0)  # [total_heads, seq_len, head_dim]
+        combined_value = torch.cat(value_tensors, dim=0)  # [total_heads, seq_len, head_dim]
+        
+        # Create a combined tensor that can be split by the Bloom block
+        # The block expects to split this into [head_dim, head_dim] along dim=-1
+        combined = torch.cat([combined_key, combined_value], dim=-1)  # [total_heads, seq_len, head_dim*2]
+        
+        return _BloomCacheWrapper(combined)
 
     def _update_cache_inplace(
         self, cache_tensors: Sequence[torch.Tensor], new_kvs: Sequence[torch.Tensor], prefix_length: int
     ):
-        """Writes new key/value tensors back into cache, works in-place"""
-        _batch_size_times_num_kv_heads, head_dim, new_length = new_kvs[0].shape
-        for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
-            new_key = new_key.view(*cache_key.shape[:3], new_length)
+        """Update cache tensors in-place with new key-value pairs."""
+        if len(cache_tensors) != len(new_kvs):
+            raise ValueError(f"Number of cache tensors ({len(cache_tensors)}) must match number of new tensors ({len(new_kvs)})")
+            
+        if len(cache_tensors) % 2 != 0:
+            raise ValueError(f"Expected even number of cache tensors (key-value pairs), got {len(cache_tensors)}")
+            
+        head_dim = self.config.hidden_size // self.config.num_attention_heads
+        new_length = prefix_length + new_kvs[0].shape[1]  # prefix_length + new sequence length
+        
+        logger.debug(f"Updating cache tensors with prefix_length={prefix_length}, new_length={new_length}")
+        
+        # Process pairs of tensors (key, value)
+        for i in range(0, len(cache_tensors), 2):
+            cache_key = cache_tensors[i]
+            cache_value = cache_tensors[i + 1]
+            new_key = new_kvs[i]
+            new_value = new_kvs[i + 1]
+            
+            logger.debug(f"Processing cache pair {i//2}:")
+            logger.debug(f"  Cache key shape: {cache_key.shape}, new key shape: {new_key.shape}")
+            logger.debug(f"  Cache value shape: {cache_value.shape}, new value shape: {new_value.shape}")
+            
+            batch_size, num_heads = cache_key.shape[:2]
+            
+            # For Bloom:
+            # - key should be [batch, heads, head_dim, seq_len]
+            # - value should be [batch, heads, seq_len, head_dim]
+            
+            # Reshape new key tensor
+            new_key = new_key.view(batch_size * num_heads, -1, head_dim)  # [batch*heads, seq_len, head_dim]
+            new_key = new_key.permute(0, 2, 1)  # [batch*heads, head_dim, seq_len]
+            new_key = new_key.reshape(batch_size, num_heads, head_dim, -1)  # [batch, heads, head_dim, seq_len]
+            
+            # Reshape new value tensor
+            new_value = new_value.view(batch_size * num_heads, -1, head_dim)  # [batch*heads, seq_len, head_dim]
+            new_value = new_value.reshape(batch_size, num_heads, -1, head_dim)  # [batch, heads, seq_len, head_dim]
+            
+            # Update the cache tensors in-place
             cache_key[:, :, :, prefix_length:new_length] = new_key[:, :, :, prefix_length:new_length]
-        for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
-            new_value = new_value.view(*cache_value.shape[:2], new_length, head_dim)
             cache_value[:, :, prefix_length:new_length, :] = new_value[:, :, prefix_length:new_length, :]
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
@@ -198,7 +329,7 @@ class TransformerBackend(ModuleBackend):
             p.data = dummy
 
 
-def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend]):
+def merge_inference_pools_inplace(backends: Dict[str, 'TransformerBackend']) -> None:
     """Replace each backend's rpc_inference pools with a combined pool runs multiple blocks in one call"""
     assert len(backends) != 0 and all(isinstance(b, TransformerBackend) for b in backends.values())
     first_pool = next(iter(backends.values())).inference_pool
@@ -214,7 +345,7 @@ def merge_inference_pools_inplace(backends: Dict[ExpertUID, TransformerBackend])
 
 
 class _MergedInferenceStep:
-    def __init__(self, backends: Dict[ExpertUID, TransformerBackend]):
+    def __init__(self, backends: Dict[str, 'TransformerBackend']) -> None:
         self.backends = backends
 
     @torch.inference_mode()
@@ -233,3 +364,54 @@ class _MergedInferenceStep:
                 hidden_states[:, : optional_prompt.shape[1]] += optional_prompt
             (hidden_states,) = self.backends[inference_info.uid].inference_step(hidden_states, hypo_ids, inference_info)
         return (hidden_states,)
+
+
+# Add the Bloom cache wrapper class to handle position tracking
+class _BloomCacheWrapper:
+    def __init__(self, combined: torch.Tensor):
+        assert isinstance(combined, torch.Tensor), "Cache wrapper requires tensor input"
+        
+        # Validate tensor shapes
+        if combined.ndim != 3:
+            raise ValueError(f"Expected 3D tensors [total_heads, seq_len, head_dim*2], got {combined.ndim}")
+            
+        logger.debug(f"Creating _BloomCacheWrapper with shapes:")
+        logger.debug(f"  Combined: {combined.shape}")
+        
+        self.combined = combined
+        
+    def __getitem__(self, index: int):
+        logger.debug(f"Accessing cache wrapper with index {index}")
+        if not isinstance(index, int):
+            raise TypeError(f"Cache wrapper index must be integer, got {type(index)}")
+        if index not in (0, 1):
+            raise IndexError(f"Cache wrapper index must be 0 or 1, got {index}")
+            
+        if index == 0:
+            return self.combined[:, :, :self.combined.shape[2]//2]
+        else:
+            return self.combined[:, :, self.combined.shape[2]//2:]
+
+    def __iter__(self):
+        logger.debug("Iterating over cache wrapper")
+        yield self.combined[:, :, :self.combined.shape[2]//2]
+        yield self.combined[:, :, self.combined.shape[2]//2:]
+
+    def update(self, new_key: torch.Tensor, new_value: torch.Tensor, layer_idx: int = 0):
+        logger.debug(f"Updating cache with shapes:")
+        logger.debug(f"  New key: {new_key.shape}")
+        logger.debug(f"  New value: {new_value.shape}")
+        
+        # Validate new tensors
+        if new_key.ndim != 3 or new_value.ndim != 3:
+            raise ValueError(f"Expected 3D tensors [total_heads, seq_len, head_dim], got key.shape={new_key.shape}, value.shape={new_value.shape}")
+            
+        if new_key.shape != new_value.shape:
+            raise ValueError(f"Key and value shapes must match, got key={new_key.shape}, value={new_value.shape}")
+            
+        # Update the cache tensors
+        self.combined = torch.cat([new_key, new_value], dim=-1)
+
+    @property
+    def shape(self):
+        return self.combined.shape

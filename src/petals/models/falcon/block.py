@@ -451,15 +451,16 @@ class WrappedFalconBlock(OptimizedFalconDecoderLayer):
 
     def _reorder_cache_from_falcon_to_bloom(self, key_value: KVCache) -> KVCache:
         key_states, value_states = key_value
-
         if self.config.new_decoder_architecture:
             key_states = self._collapse_states(key_states)
             value_states = self._collapse_states(value_states)
-
-        assert key_states.shape == value_states.shape  # Both are [batch_size * num_kv_heads, seq_len, head_dim]
+        
+        assert key_states.shape == value_states.shape
         key_states = key_states.permute(0, 2, 1)
-
-        return (key_states, value_states)
+        combined = torch.cat([key_states, value_states], dim=-1)
+        print(f"Falcon->Bloom cache type: {type(combined)}, shape: {combined.shape}")
+        assert isinstance(combined, torch.Tensor), "Falcon must return single tensor"
+        return (combined,)
 
     def _expand_states(self, state: torch.Tensor) -> torch.Tensor:
         batch_size_x_num_kv_heads, seq_len, head_dim = state.shape

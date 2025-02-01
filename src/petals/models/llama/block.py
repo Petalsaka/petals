@@ -297,4 +297,8 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         )
         key_states = key_states.view(*value_states.shape)
         key_states = key_states.permute(0, 2, 1)
-        return (key_states, value_states)
+        
+        combined = torch.cat([key_states, value_states], dim=-1)
+        print(f"Llama->Bloom cache type: {type(combined)}, shape: {combined.shape}")
+        assert isinstance(combined, torch.Tensor), "Llama must return single tensor"
+        return (combined,)

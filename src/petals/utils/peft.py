@@ -3,7 +3,6 @@ import re
 import time
 from typing import List, Optional, Sequence, Union
 
-import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 import transformers
@@ -24,6 +23,29 @@ from petals.utils.misc import get_size_in_bytes
 
 logger = get_logger(__name__)
 
+# Try to import quantization-related modules, but don't fail if they're not available
+HAVE_QUANTIZATION = False
+try:
+    import bitsandbytes as bnb
+    from peft.tuners.lora import Linear8bitLt, Linear4bit
+    HAVE_QUANTIZATION = True
+except (ImportError, RuntimeError) as e:
+    logger.warning(f"Quantization support is disabled: {str(e)}")
+    # Create dummy classes for quantized layers
+    class Linear8bitLt:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "8-bit quantization is not available. Please install bitsandbytes and its dependencies "
+                "to use 8-bit quantized layers."
+            )
+    
+    class Linear4bit:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "4-bit quantization is not available. Please install bitsandbytes and its dependencies "
+                "to use 4-bit quantized layers."
+            )
+
 
 COMMON_LAYERS_PATTERN = ["layers", "h", "block", "blocks", "layer"]
 
@@ -36,7 +58,7 @@ def load_specific_module(block_idx: int, filepath: str, framework: str = "pt", d
     tensors = dict()
     is_tensors_found = dict()
     common_layer_patter_re = (
-        ".+\." + "".join(f"({common_name})?" for common_name in COMMON_LAYERS_PATTERN) + f"\.({block_idx})?\..+"
+        r".+\." + "".join(rf"({common_name})?" for common_name in COMMON_LAYERS_PATTERN) + rf"\.({block_idx})?\..+"
     )
     with safe_open(filepath, framework=framework, device=device) as f:
         for k in f.keys():
@@ -171,22 +193,42 @@ using_adapter = AdapterContextMixin.using_adapter
 
 
 class LoraLinear(AdapterContextMixin, lora.Linear):
-    """LoRA linear layer that uses adapter selected via using_adapter"""
-
+    """Base LoRA linear layer that uses adapter selected via using_adapter"""
     def __init__(self, base_layer, adapter_name: str):
-        nn.Module.__init__(self)
-        lora.LoraLayer.__init__(self, base_layer)
-
-        self._active_adapter = adapter_name
-        self.is_target_conv_1d_layer = False
+        super().__init__(base_layer, adapter_name)
+        self._active_adapter = self.ADAPTER_NOT_SET
 
 
-class LoraLinear8bitLt(LoraLinear, lora.Linear8bitLt):
-    """LoRA linear 8-bit with outliers that uses adapter selected via using_adapter"""
+class LoraLinear8bitLt(LoraLinear):
+    """8-bit LoRA linear layer implementation."""
+    def __new__(cls, *args, **kwargs):
+        if not HAVE_QUANTIZATION:
+            raise ImportError(
+                "8-bit quantization support is not available. "
+                "Please install bitsandbytes and its dependencies, or use regular LoraLinear without quantization."
+            )
+        # Dynamically create the class only when quantization is available
+        return type(
+            "LoraLinear8bitLt",
+            (LoraLinear, Linear8bitLt),
+            {}
+        )(*args, **kwargs)
 
 
-class LoraLinear4bit(LoraLinear, lora.Linear4bit):
-    """LoRA linear 4-bit that uses adapter selected via using_adapter"""
+class LoraLinear4bit(LoraLinear):
+    """4-bit LoRA linear layer implementation."""
+    def __new__(cls, *args, **kwargs):
+        if not HAVE_QUANTIZATION:
+            raise ImportError(
+                "4-bit quantization support is not available. "
+                "Please install bitsandbytes and its dependencies, or use regular LoraLinear without quantization."
+            )
+        # Dynamically create the class only when quantization is available
+        return type(
+            "LoraLinear4bit",
+            (LoraLinear, Linear4bit),
+            {}
+        )(*args, **kwargs)
 
 
 def create_lora_adapter(block):

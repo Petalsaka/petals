@@ -24,6 +24,7 @@ class RemotePastKeyValues(Cache):
         super().__init__()
         self._seen_tokens = 0
         self.hypo_ids: Optional[torch.LongTensor] = None
+        self._cache_position = None
 
     def __getitem__(self, _index: int) -> List[torch.Tensor]:
         return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()
@@ -39,6 +40,12 @@ class RemotePastKeyValues(Cache):
 
     def reorder_cache(self, beam_idx):
         raise NotImplementedError("Beam search reordering is not implemented yet")
+
+    def update_cache_position(self, position: Optional[int]) -> None:
+        self._cache_position = position
+
+    def get_cache_position(self) -> Optional[int]:
+        return self._cache_position
 
 
 _skipped_tokens = ContextVar("skipped_tokens", default=0)
@@ -85,30 +92,28 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         self, inputs: Optional[torch.Tensor] = None, *args, session: Optional[InferenceSession] = None, **kwargs
     ):
         self._fix_generate_kwargs(kwargs)
-        if inputs is None:
-            inputs = kwargs.pop("input_ids", None)
 
-        if session is not None:
-            # If a session specified explicitly, use it
-            context_manager = self.use_session(session)
-        elif self.active_session is not None:
-            # If there's an active session, don't do anything
-            context_manager = contextlib.nullcontext(self.active_session)
-        else:
-            # If there's no active session, create a new one
-
-            max_length = kwargs.get("max_length")
+        if session is None:
+            # Create a new session with proper max_length
             max_new_tokens = kwargs.get("max_new_tokens")
-            assert (max_length is None) != (
-                max_new_tokens is None
-            ), "You should set `max_length` or `max_new_tokens` (but not both) to reserve server-side attention caches"
+            max_length = kwargs.get("max_length")
+            if max_new_tokens is None and max_length is None:
+                raise ValueError("Please specify either max_new_tokens or max_length")
 
-            session_max_length = self.transformer.config.pre_seq_len
-            if max_length is not None:
-                session_max_length += max_length
+            if inputs is not None:
+                input_length = inputs.shape[1]
+            elif self.active_session is not None and self.active_session.output_ids is not None:
+                input_length = self.active_session.output_ids.shape[1]
             else:
-                session_max_length += (inputs.shape[1] if inputs is not None else 0) + max_new_tokens
-            context_manager = self.inference_session(max_length=session_max_length)
+                input_length = 0
+
+            if max_length is not None:
+                max_new_tokens = max_length - input_length
+            max_length = input_length + max_new_tokens
+
+            context_manager = self.inference_session(max_length=max_length)
+        else:
+            context_manager = self.use_session(session)
 
         with context_manager as session:
             # Prepend the tokens from the previous .generate() call
@@ -132,21 +137,15 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             if self._supports_cache_class and "past_key_values" not in kwargs:
                 past_key_values = RemotePastKeyValues()
                 past_key_values.update_seen(session.position)
+                if inputs is not None:
+                    past_key_values.hypo_ids = torch.arange(inputs.shape[0], dtype=torch.int64, device=inputs.device)
                 kwargs["past_key_values"] = past_key_values
 
             result = super().generate(inputs, *args, **kwargs)
 
             sequences = result.sequences if isinstance(result, ModelOutput) else result
-            # Save tokens from this .generate() call
             session.output_ids = sequences
-            # Crop the last tokens from the previous call
-            sequences = sequences[:, n_prev_tokens:].clone()
-            if isinstance(result, ModelOutput):
-                result.sequences = sequences
-            else:
-                result = sequences
-
-        return result
+            return result
 
     @staticmethod
     def _fix_generate_kwargs(kwargs: dict):

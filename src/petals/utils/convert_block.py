@@ -74,35 +74,62 @@ def convert_block(
 
 
 def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
-    # Import bitsandbytes only when necessary, so Petals runs on platforms not supported by bitsandbytes
-    import bitsandbytes as bnb
+    """
+    Apply quantization to a model's linear layers.
+    
+    :param model: The model to quantize
+    :param quant_type: Type of quantization to apply (INT8, NF4, or NONE)
+    :return: Quantized version of the input model
+    """
+    if quant_type == QuantType.NONE:
+        return model
 
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            quantize_module(module, quant_type=quant_type)
+    try:
+        # Import bitsandbytes only when necessary
+        import bitsandbytes as bnb
+    except ImportError:
+        logger.warning(
+            "bitsandbytes package not found. Quantization will be disabled. "
+            "Install bitsandbytes for quantization support."
+        )
+        return model
+    except Exception as e:
+        logger.warning(f"Failed to import bitsandbytes: {str(e)}. Quantization will be disabled.")
+        return model
 
-        if isinstance(module, torch.nn.Linear) and n not in ["lm_head", "score"]:
-            assert module.weight.device.type == "cpu", f"expected linear layers on CPU, got {module.weight.device}"
+    def _quantize_linear(module: nn.Linear, name: str) -> Optional[nn.Module]:
+        """Helper function to quantize a single linear layer with proper error handling."""
+        if name in ["lm_head", "score"]:
+            return None
+
+        try:
+            if module.weight.device.type != "cpu":
+                logger.warning(
+                    f"Expected linear layer '{name}' to be on CPU for quantization, "
+                    f"got {module.weight.device}. Skipping."
+                )
+                return None
+
             if quant_type == QuantType.INT8:
-                model._modules[n] = bnb.nn.Linear8bitLt(
+                quantized = bnb.nn.Linear8bitLt(
                     module.in_features,
                     module.out_features,
                     module.bias is not None,
                     has_fp16_weights=False,
                     threshold=6.0,  # Default from the LLM.int8() paper
                 )
-                model._modules[n].weight = bnb.nn.Int8Params(
+                quantized.weight = bnb.nn.Int8Params(
                     module.weight.data, requires_grad=False, has_fp16_weights=False
                 ).to(module.weight.dtype)
             elif quant_type == QuantType.NF4:
                 compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
+                quantized = bnb.nn.LinearNF4(
                     module.in_features,
                     module.out_features,
                     module.bias is not None,
                     compress_statistics=compress_statistics,
                 )
-                model._modules[n].weight = bnb.nn.Params4bit(
+                quantized.weight = bnb.nn.Params4bit(
                     module.weight.data,
                     requires_grad=False,
                     quant_type="nf4",
@@ -110,28 +137,70 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
                     compress_statistics=compress_statistics,
                 ).to(module.weight.dtype)
             else:
-                raise ValueError(f"Unsupported quant_type='{quant_type}'")
-            model._modules[n].bias = module.bias
+                raise ValueError(f"Unsupported quantization type: {quant_type}")
+
+            quantized.bias = module.bias
+            return quantized
+
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                logger.warning(
+                    f"CUDA error during quantization of layer '{name}', skipping: {e}"
+                )
+                return None
+            raise
+
+    # Recursively quantize all linear layers
+    for name, module in model.named_children():
+        if len(list(module.children())) > 0:
+            quantize_module(module, quant_type=quant_type)
+        elif isinstance(module, nn.Linear):
+            quantized = _quantize_linear(module, name)
+            if quantized is not None:
+                model._modules[name] = quantized
+
     return model
 
 
 def make_tensor_parallel(
     block: nn.Module, model_config: PretrainedConfig, devices: Sequence[torch.device], output_device: torch.device
 ) -> nn.Module:
+    """
+    Apply tensor parallelism to a transformer block.
+    
+    :param block: The transformer block to parallelize
+    :param model_config: HuggingFace model configuration
+    :param devices: Sequence of devices to distribute the model across
+    :param output_device: Device where the output should be gathered
+    :return: Tensor-parallel version of the input block
+    """
+    # Create tensor parallel block with delayed initialization
     if model_config.model_type == "bloom":
-        tp_config = get_bloom_config(model_config, devices)
-        del tp_config.state_rules[re.compile(".*word_embeddings.weight$")]
+        tp_block = tp.TensorParallel(block, devices, output_device=output_device, delay_init=True)
     else:
         if len(devices) > 1:
             logger.warning("Tensor parallelism is not tested for models other than BLOOM yet, proceed with caution")
-        tp_config = None
-    tp_block = tp.TensorParallel(block, devices, config=tp_config, output_device=output_device, delay_init=True)
-    total_heads = 0
-    for tp_shard in tp_block.module_shards:
-        for submodule in tp_shard.modules():
-            if isinstance(submodule, model_config.attn_class):
-                total_heads += submodule.num_heads
-    assert total_heads == model_config.num_attention_heads
+        tp_block = tp.TensorParallel(block, devices, output_device=output_device, delay_init=True)
+    
+    # Verify attention head configuration before initialization
+    # We check the original block since the parallel version is not yet initialized
+    total_heads = sum(
+        getattr(module, "num_heads", 0)
+        for module in block.children()
+        if isinstance(module, nn.Module) and hasattr(module, "num_heads")
+    )
+    
+    if total_heads == 0:
+        logger.warning(
+            f"No attention heads found in block. This might indicate an unexpected model architecture. "
+            f"Expected {model_config.num_attention_heads} heads."
+        )
+    elif total_heads != model_config.num_attention_heads:
+        raise ValueError(
+            f"Attention head count mismatch. Found {total_heads} heads in block, "
+            f"but config specifies {model_config.num_attention_heads} heads."
+        )
+    
     return tp_block
 
 

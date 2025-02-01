@@ -48,6 +48,8 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -63,6 +65,8 @@ class DistributedBloomModel(FromPretrainedMixin, PTuneMixin, BloomModel):
         assert (
             attention_mask is None or (attention_mask == 1).all()
         ), f"Custom attention masks are not supported, {attention_mask=}"
+        if cache_position is not None:
+            assert position_ids is not None and torch.all(torch.eq(cache_position, position_ids)).item()
         assert head_mask is None, f"Custom head masks are not supported, {head_mask=}"
         assert use_cache is None or use_cache, f"{use_cache=} is not supported"
         assert not output_attentions, f"{output_attentions=} is not supported"
@@ -133,6 +137,10 @@ class DistributedBloomForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Bl
                 cache_length = past_key_values.get_seq_length()
                 past_length = past_key_values._seen_tokens
                 max_cache_length = past_key_values.get_max_length()
+                if hasattr(past_key_values, 'get_cache_position') and hasattr(past_key_values, 'update_cache_position'):
+                    cache_position = kwargs.get('cache_position', None)
+                    if cache_position is not None:
+                        past_key_values.update_cache_position(cache_position)
             else:
                 cache_length = past_length = past_key_values[0][0].shape[2]
                 max_cache_length = None

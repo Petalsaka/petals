@@ -1,4 +1,5 @@
 import torch
+from typing import Union, Tuple
 
 DUMMY = torch.empty(0)  # dummy tensor that replaces empty prompt or adapter parameters
 
@@ -7,7 +8,9 @@ DUMMY_INT64 = torch.empty(0, dtype=torch.int64)
 DUMMY_KEY_PAST = torch.empty((0, 0, 0))
 
 
-def is_dummy(tensor: torch.Tensor) -> bool:
+def is_dummy(tensor: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> bool:
+    if isinstance(tensor, tuple):
+        return any(t.numel() == 0 for t in tensor)
     return tensor.numel() == 0
 
 
