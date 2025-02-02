@@ -54,5 +54,18 @@ def get_block_size(
 
 
 def get_model_block(config, layer_idx: int):
-    """Get a block from the model configuration"""
-    return config.block_class(config, layer_idx=layer_idx)
+    """
+    Get a block from the model configuration.
+    Different block types may have different initialization requirements:
+    - DeepSeek blocks require layer_idx
+    - Mixtral blocks require layer_idx and attn implementation config
+    - BLOOM blocks don't use layer_idx
+    """
+    if config.block_class.__name__ == 'WrappedDeepSeekBlock':
+        return config.block_class(config, layer_idx=layer_idx)
+    elif config.block_class == WrappedMixtralBlock:
+        config = PreTrainedModel._autoset_attn_implementation(config)
+        return config.block_class(config, layer_idx=layer_idx)
+    else:
+        # Default case (e.g., BLOOM) - don't pass layer_idx
+        return config.block_class(config)
