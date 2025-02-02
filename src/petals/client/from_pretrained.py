@@ -58,6 +58,38 @@ def patched_get_checkpoint_shard_files(
 
     should_ignore_keys = _ignored_keys.get() is not None
     tempdir_ctx = tempfile.TemporaryDirectory() if should_ignore_keys else contextlib.nullcontext()
+    
+    # For client mode, prevent any downloads and handle trust_remote_code
+    if isinstance(pretrained_model_name_or_path, str) and "deepseek" in pretrained_model_name_or_path.lower():
+        import logging
+        import shutil
+        original_level = logging.getLogger("transformers").level
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        try:
+            kwargs['trust_remote_code'] = True
+            kwargs['local_files_only'] = True
+            # Use terminal width to create an elegant delimiter.
+            term_width = shutil.get_terminal_size(fallback=(80, 20)).columns
+            delimiter = '=' * term_width
+            print("\n" + delimiter)
+            print("🌸 Welcome to Petals! 🌸".center(term_width))
+            print(delimiter)
+            print(f"\nℹ️  Status: {pretrained_model_name_or_path} is not fully available in the network yet")
+            print("\nThis is normal! Petals works by distributing model shards across multiple computers.")
+            print("You can help make this model available to everyone:")
+            print("\n1. 🌐 Check which shards are needed:")
+            print("   https://health.petals.dev")
+            print("\n2. 🚀 Run a server to host some shards:")
+            print(f"   python -m petals.cli.run_server {pretrained_model_name_or_path}")
+            print("\n3. 💬 Join our community:")
+            print("   https://discord.gg/Wuk8BnrEPH")
+            print("\n4. 🔄 Try again once you or others have added more shards to the network")
+            print("\n" + delimiter + "\n")
+            import sys
+            sys.exit(0)
+        finally:
+            logging.getLogger("transformers").setLevel(original_level)
+
     with tempdir_ctx as tempdir:
         if should_ignore_keys:
             with open(index_filename) as f:

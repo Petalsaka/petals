@@ -34,3 +34,31 @@ def _override_bfloat16_mode_default():
 
 _initialize_logs()
 _override_bfloat16_mode_default()
+
+# Monkey-patch AutoTokenizer.from_pretrained for DeepSeek models to suppress trust_remote_code warning
+import logging
+import warnings
+import sys
+
+_real_AutoTokenizer_from_pretrained = transformers.AutoTokenizer.from_pretrained
+
+def _patched_AutoTokenizer_from_pretrained(model_name, *args, **kwargs):
+    if "deepseek" in model_name.lower():
+        original_level = logging.getLogger("transformers").level
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        old_warning_filters = warnings.filters[:]
+        warnings.filterwarnings("ignore", message="The argument `trust_remote_code`", category=UserWarning)
+        old_stderr_write = sys.stderr.write
+        sys.stderr.write = lambda s: None
+        try:
+            result = _real_AutoTokenizer_from_pretrained(model_name, *args, **kwargs)
+        finally:
+            logging.getLogger("transformers").setLevel(original_level)
+            warnings.filters = old_warning_filters
+            sys.stderr.write = old_stderr_write
+        return result
+    else:
+        return _real_AutoTokenizer_from_pretrained(model_name, *args, **kwargs)
+
+# Apply the monkey patch
+transformers.AutoTokenizer.from_pretrained = _patched_AutoTokenizer_from_pretrained

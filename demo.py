@@ -6,7 +6,8 @@ initial_peers = [
 ]
 
 # Choose any model available at https://health.petals.dev
-model_name = "bigscience/bloom-560m"
+# model_name = "bigscience/bloom-560m"
+model_name = "deepseek-ai/DeepSeek-R1"
 
 # Connect to a distributed network hosting model layers
 tokenizer = AutoTokenizer.from_pretrained(model_name)

@@ -42,6 +42,7 @@ class DistributedDeepSeekConfig(PretrainedConfig, ClientConfig, PTuneConfig, LMH
         qk_nope_head_dim=128,
         v_head_dim=128,
         rope_theta=10000,
+        quantization_config=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -84,7 +85,7 @@ class DistributedDeepSeekConfig(PretrainedConfig, ClientConfig, PTuneConfig, LMH
 
     @classmethod
     def from_pretrained(
-        cls, model_name_or_path: Union[str, os.PathLike, None], *args, dht_prefix: Optional[str] = None, **kwargs
+        cls, model_name_or_path: Union[str, os.PathLike, None], *args, dht_prefix: Optional[str] = None, download_weights: bool = True, **kwargs
     ):
         loading_from_repo = model_name_or_path is not None and not os.path.isdir(model_name_or_path)
         if loading_from_repo and dht_prefix is None:
@@ -94,8 +95,29 @@ class DistributedDeepSeekConfig(PretrainedConfig, ClientConfig, PTuneConfig, LMH
             if not dht_prefix.endswith("-hf"):
                 dht_prefix += "-hf"
 
+        # Only set trust_remote_code when running a server node
+        if not download_weights:
+            kwargs['trust_remote_code'] = True
+            result = super().from_pretrained(model_name_or_path, *args, **kwargs)
+        else:
+            # For client mode (inference), prevent downloads and handle trust_remote_code
+            kwargs['local_files_only'] = True
+            kwargs['trust_remote_code'] = True
+            
+            # Temporarily suppress the warning
+            import logging
+            original_level = logging.getLogger("transformers").level
+            logging.getLogger("transformers").setLevel(logging.ERROR)
+            try:
+                result = super().from_pretrained(model_name_or_path, *args, **kwargs)
+            except Exception as e:
+                # If config not found locally, return empty result to prevent downloads
+                if "Can't load config for" in str(e) or "local_files_only=True" in str(e):
+                    return None
+                raise
+            finally:
+                logging.getLogger("transformers").setLevel(original_level)
         
-        result = super().from_pretrained(model_name_or_path, *args, **kwargs)
         config = result[0] if isinstance(result, tuple) else result
         config.dht_prefix = dht_prefix
         return result

@@ -41,10 +41,42 @@ class _AutoDistributedBase:
         ):
             kwargs["use_auth_token"] = True
 
-        if isinstance(model_name_or_path, str) and "deepseek-ai" in model_name_or_path.lower():
-            kwargs.setdefault("trust_remote_code", True)
+        # For client mode (inference) for DeepSeek models, prevent downloads and handle trust_remote_code
+        if "deepseek" in str(model_name_or_path).lower():
+            kwargs['trust_remote_code'] = True
+            kwargs['local_files_only'] = True
+            
+            import logging
+            import warnings
+            import sys
+            
+            original_level = logging.getLogger("transformers").level
+            logging.getLogger("transformers").setLevel(logging.ERROR)
+            
+            # Temporarily suppress warnings that mention 'The argument `trust_remote_code`'
+            old_warning_filters = warnings.filters[:]
+            warnings.filterwarnings("ignore", message="The argument `trust_remote_code`", category=UserWarning)
+            
+            # Monkey-patch sys.stderr.write to suppress unwanted messages
+            old_stderr_write = sys.stderr.write
+            sys.stderr.write = lambda s: None
+            try:
+                config = AutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
+            except Exception as e:
+                if "Can't load config for" in str(e) or "local_files_only=True" in str(e):
+                    raise ValueError(f"Configuration for {model_name_or_path} is not available locally. Inference cannot proceed without hosting shards.") from e
+                raise
+            finally:
+                logging.getLogger("transformers").setLevel(original_level)
+                warnings.filters = old_warning_filters
+                sys.stderr.write = old_stderr_write
+            
+            # Remove 'trust_remote_code' from kwargs to avoid its warning in subsequent calls
+            if "trust_remote_code" in kwargs:
+                del kwargs["trust_remote_code"]
+        else:
+            config = AutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
 
-        config = AutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
         if config.model_type not in _CLASS_MAPPING:
             raise ValueError(f"Petals does not support model type {config.model_type}")
 

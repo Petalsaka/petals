@@ -112,6 +112,8 @@ class Server:
             converted_model_name_or_path,
             use_auth_token=token,
             revision=revision,
+            trust_remote_code=True,
+            download_weights=False,
         )
 
         if dht_prefix is None:
