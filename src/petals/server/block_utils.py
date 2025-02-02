@@ -53,13 +53,6 @@ def get_block_size(
     return round(n_params * bytes_per_value * (1 + eps))
 
 
-def get_model_block(config, layer_idx: int = 0):
-    """
-    The function to create a model block based on the block class
-    kwargs argument **only** is necessary for specific classes, like Mixtral.
-    They will not be passed to other block constructors.
-    """
-    if config.block_class == WrappedMixtralBlock:
-        config = PreTrainedModel._autoset_attn_implementation(config)
-        return config.block_class(config, layer_idx)
-    return config.block_class(config)
+def get_model_block(config, layer_idx: int):
+    """Get a block from the model configuration"""
+    return config.block_class(config, layer_idx=layer_idx)

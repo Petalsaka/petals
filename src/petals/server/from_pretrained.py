@@ -115,7 +115,9 @@ def load_pretrained_block(
                 break
 
         if param_data is None:
-            logger.warning(f"Parameter {load_key} not found in state dict (tried {possible_keys})")
+            # Only warn about missing parameters if they're not expert parameters from other blocks
+            if not any(x in load_key for x in ['experts', 'router']):
+                logger.warning(f"Parameter {load_key} not found in state dict (tried {possible_keys})")
             continue
 
         # Check if the loaded param shape matches the expected shape

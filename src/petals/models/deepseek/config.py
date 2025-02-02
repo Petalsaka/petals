@@ -94,10 +94,6 @@ class DistributedDeepSeekConfig(PretrainedConfig, ClientConfig, PTuneConfig, LMH
             if not dht_prefix.endswith("-hf"):
                 dht_prefix += "-hf"
 
-        # For DeepSeek models we want to indicate remote code trust, but this argument is only relevant for Auto classes.
-        # Thus, we set it and then remove it to avoid the warning.
-        kwargs['trust_remote_code'] = True
-        kwargs.pop('trust_remote_code', None)
         
         result = super().from_pretrained(model_name_or_path, *args, **kwargs)
         config = result[0] if isinstance(result, tuple) else result

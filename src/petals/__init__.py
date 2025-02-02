@@ -16,6 +16,7 @@ from petals.client import *
 from petals.models import *
 from petals.utils import *
 from petals.utils.logging import initialize_logs as _initialize_logs
+import petals.models.deepseek
 
 __version__ = "2.3.0.dev2"
 

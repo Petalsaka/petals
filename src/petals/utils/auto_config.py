@@ -41,6 +41,9 @@ class _AutoDistributedBase:
         ):
             kwargs["use_auth_token"] = True
 
+        if isinstance(model_name_or_path, str) and "deepseek-ai" in model_name_or_path.lower():
+            kwargs.setdefault("trust_remote_code", True)
+
         config = AutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
         if config.model_type not in _CLASS_MAPPING:
             raise ValueError(f"Petals does not support model type {config.model_type}")

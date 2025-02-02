@@ -12,6 +12,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 
 from petals.utils.cuda_graphs import make_inference_graphed_callable
+from petals.models.deepseek.moe import DeepSeekMoELayer
 
 
 def rotate_half(x):
@@ -161,30 +162,12 @@ class DeepSeekAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class DeepSeekMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-        self.register_buffer('gate_proj_weight_scale_inv', torch.ones(1))
-        self.register_buffer('up_proj_weight_scale_inv', torch.ones(1))
-        self.register_buffer('down_proj_weight_scale_inv', torch.ones(1))
-
-    def forward(self, x):
-        gate = self.gate_proj(x) * self.gate_proj_weight_scale_inv
-        up = self.up_proj(x) * self.up_proj_weight_scale_inv
-        down = self.down_proj(self.act_fn(gate) * up) * self.down_proj_weight_scale_inv
-        return down
-
-
 class DeepSeekBlock(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = DeepSeekAttention(config)
-        self.mlp = DeepSeekMLP(config)
+        self.moe = DeepSeekMoELayer(config, layer_idx)
         self.input_layernorm = DeepSeekRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = DeepSeekRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -214,10 +197,10 @@ class DeepSeekBlock(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # MoE Layer
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.moe(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)

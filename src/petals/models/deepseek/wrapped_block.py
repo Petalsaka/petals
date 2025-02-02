@@ -1,6 +1,10 @@
 """Wrapper for DeepSeek block that maps parameter names to match the Hugging Face implementation"""
 
+import torch
 import torch.nn as nn
+from hivemind.moe.server.module_backend import ModuleBackend
+from hivemind.moe.server.runtime import Runtime
+from hivemind.utils.tensor_descr import TensorDescriptor
 from petals.models.deepseek.config import DistributedDeepSeekConfig
 
 class WrappedDeepSeekBlock(nn.Module):
@@ -8,31 +12,62 @@ class WrappedDeepSeekBlock(nn.Module):
 
     def __init__(self, config: DistributedDeepSeekConfig, layer_idx: int = None):
         super().__init__()
+        if layer_idx is None:
+            raise ValueError("layer_idx must be provided")
+        
         # Lazy import to avoid circular dependency
         from petals.models.deepseek.block import DeepSeekBlock
         self.block = DeepSeekBlock(config, layer_idx)
         self.layer_idx = layer_idx
 
+        # Initialize module backends for expert computation
+        self.module_backends = {}
+        for i in range(self.block.moe.num_experts):
+            expert = self.block.moe.experts[i]
+            expert_name = f"expert.{i}"
+            
+            # Get schemas from expert
+            args_schema = expert.get_args_schema()
+            kwargs_schema = expert.get_kwargs_schema()
+            
+            self.module_backends[expert_name] = ModuleBackend(
+                name=expert_name,
+                module=expert,
+                args_schema=args_schema,
+                kwargs_schema=kwargs_schema,
+                max_batch_size=2048,  # Large enough for typical sequence lengths
+            )
+
+        # Initialize runtime with module backends
+        self.runtime = Runtime(module_backends=self.module_backends)
+
         # Map from HuggingFace parameter names to internal names
         self._param_mapping = {
             # Attention parameters
-            f'model.layers.{layer_idx}.self_attn.q_a_proj.weight': 'block.self_attn.q_a_proj.weight',
-            f'model.layers.{layer_idx}.self_attn.q_b_proj.weight': 'block.self_attn.q_b_proj.weight',
-            f'model.layers.{layer_idx}.self_attn.kv_a_proj_with_mqa.weight': 'block.self_attn.kv_a_proj_with_mqa.weight',
-            f'model.layers.{layer_idx}.self_attn.kv_b_proj.weight': 'block.self_attn.kv_b_proj.weight',
-            f'model.layers.{layer_idx}.self_attn.q_a_layernorm.weight': 'block.self_attn.q_a_layernorm.weight',
-            f'model.layers.{layer_idx}.self_attn.kv_a_layernorm.weight': 'block.self_attn.kv_a_layernorm.weight',
-            f'model.layers.{layer_idx}.self_attn.o_proj.weight': 'block.self_attn.o_proj.weight',
+            f'model.layers.{self.layer_idx}.self_attn.q_a_proj.weight': 'block.self_attn.q_a_proj.weight',
+            f'model.layers.{self.layer_idx}.self_attn.q_b_proj.weight': 'block.self_attn.q_b_proj.weight',
+            f'model.layers.{self.layer_idx}.self_attn.kv_a_proj_with_mqa.weight': 'block.self_attn.kv_a_proj_with_mqa.weight',
+            f'model.layers.{self.layer_idx}.self_attn.kv_b_proj.weight': 'block.self_attn.kv_b_proj.weight',
+            f'model.layers.{self.layer_idx}.self_attn.q_a_layernorm.weight': 'block.self_attn.q_a_layernorm.weight',
+            f'model.layers.{self.layer_idx}.self_attn.kv_a_layernorm.weight': 'block.self_attn.kv_a_layernorm.weight',
+            f'model.layers.{self.layer_idx}.self_attn.o_proj.weight': 'block.self_attn.o_proj.weight',
             
             # Layer norms
-            f'model.layers.{layer_idx}.input_layernorm.weight': 'block.input_layernorm.weight',
-            f'model.layers.{layer_idx}.post_attention_layernorm.weight': 'block.post_attention_layernorm.weight',
+            f'model.layers.{self.layer_idx}.input_layernorm.weight': 'block.input_layernorm.weight',
+            f'model.layers.{self.layer_idx}.post_attention_layernorm.weight': 'block.post_attention_layernorm.weight',
             
-            # MLP parameters
-            f'model.layers.{layer_idx}.mlp.gate_proj.weight': 'block.mlp.gate_proj.weight',
-            f'model.layers.{layer_idx}.mlp.up_proj.weight': 'block.mlp.up_proj.weight',
-            f'model.layers.{layer_idx}.mlp.down_proj.weight': 'block.mlp.down_proj.weight',
+            # Router parameters
+            f'model.layers.{self.layer_idx}.moe.router.router_weights.weight': 'block.moe.router.router_weights.weight',
         }
+
+        # Add expert parameters
+        for i in range(256):  # DeepSeek-R1 specific number of experts
+            expert_params = {
+                f'model.layers.{self.layer_idx}.moe.experts.{i}.expert.gate_proj.weight': f'block.moe.experts.{i}.expert.gate_proj.weight',
+                f'model.layers.{self.layer_idx}.moe.experts.{i}.expert.up_proj.weight': f'block.moe.experts.{i}.expert.up_proj.weight',
+                f'model.layers.{self.layer_idx}.moe.experts.{i}.expert.down_proj.weight': f'block.moe.experts.{i}.expert.down_proj.weight',
+            }
+            self._param_mapping.update(expert_params)
 
         # Create reverse mapping for state_dict conversion
         self._reverse_param_mapping = {v: k for k, v in self._param_mapping.items()}

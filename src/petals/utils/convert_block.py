@@ -55,8 +55,11 @@ def convert_block(
     if quant_type != QuantType.NONE:
         block = quantize_module(block, quant_type=quant_type)
 
-    for shard, device in zip(block.module_shards, block.devices):
-        shard.to(device)
+    for i, (shard, device) in enumerate(zip(block.module_shards, block.devices)):
+        if any(param.device.type == "meta" for param in shard.parameters(recurse=True)):
+            block.module_shards[i] = shard.to_empty(device=device)
+        else:
+            block.module_shards[i] = shard.to(device)
 
     if adapters:
         from petals.utils.peft import add_adapter_to_block, create_lora_adapter, load_peft
