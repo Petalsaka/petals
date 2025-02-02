@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from collections import Counter
 from itertools import chain
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union, TypeAlias
 
 import torch
 from hivemind import BatchTensorDescriptor, TensorDescriptor
-from hivemind.moe.expert_uid import ExpertUID
+# from hivemind.moe.expert_uid import ExpertUID
 from hivemind.moe.server.module_backend import ModuleBackend
 from hivemind.utils import get_logger
 from tensor_parallel import TensorParallel
@@ -19,6 +19,8 @@ from petals.server.task_pool import PrioritizedTaskPool
 from petals.utils.misc import get_size_in_bytes, is_dummy
 
 logger = get_logger(__name__)
+
+ExpertUID: TypeAlias = str
 
 
 class TransformerBackend(ModuleBackend):

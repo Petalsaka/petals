@@ -3,11 +3,11 @@ This module implements server-side computations on served blocks: forward, backw
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union, TypeAlias
 
 import torch
 from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
-from hivemind.moe.expert_uid import ExpertUID
+# from hivemind.moe.expert_uid import ExpertUID
 from hivemind.proto import runtime_pb2
 from hivemind.utils.logging import get_logger
 from hivemind.utils.nested import nested_flatten
@@ -27,6 +27,8 @@ MAX_SHORT_INFERENCE_TOKENS = 128
 MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
+
+ExpertUID: TypeAlias = str
 
 
 async def run_rpc_forward(
@@ -143,7 +145,7 @@ async def run_rpc_backward(
 
 async def iterate_rpc_inference(
     requested_uids: Sequence[ExpertUID],
-    requested_backends: Sequence[TransformerBackend],
+    requested_backends: Sequence["TransformerBackend"],
     active_adapter: Optional[str],
     input_iterator: AsyncIterator[Tuple[runtime_pb2.ExpertRequest, dict]],
     cache_handles: Sequence[Sequence[Handle]],
